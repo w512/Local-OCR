@@ -108,6 +108,64 @@ class TestNormalizeOllamaUrl(unittest.TestCase):
                     ocr_service.normalize_ollama_url(value)
 
 
+class TestNormalizeServerUrl(unittest.TestCase):
+    """normalize_server_url is the shared validator for both providers."""
+
+    def test_default_urls_unchanged(self):
+        self.assertEqual(
+            ocr_service.normalize_server_url("http://localhost:11434"),
+            "http://localhost:11434",
+        )
+        self.assertEqual(
+            ocr_service.normalize_server_url("http://localhost:1234"),
+            "http://localhost:1234",
+        )
+
+    def test_whitespace_and_trailing_slash_trimmed(self):
+        self.assertEqual(
+            ocr_service.normalize_server_url("  http://192.168.1.20:1234/  "),
+            "http://192.168.1.20:1234",
+        )
+
+    def test_https_accepted(self):
+        self.assertEqual(
+            ocr_service.normalize_server_url("https://lmstudio.example.com"),
+            "https://lmstudio.example.com",
+        )
+
+    def test_reverse_proxy_path_prefix_preserved(self):
+        self.assertEqual(
+            ocr_service.normalize_server_url("https://server.lan/ollama/"),
+            "https://server.lan/ollama",
+        )
+
+    def test_empty_rejected(self):
+        for value in ("", "   ", "///"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ocr_service.normalize_server_url(value)
+
+    def test_missing_host_rejected(self):
+        for value in ("http://", "http:///path"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ocr_service.normalize_server_url(value)
+
+    def test_non_http_scheme_rejected(self):
+        for value in ("ftp://host:1234", "file:///tmp/x", "localhost:1234"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ocr_service.normalize_server_url(value)
+
+    def test_normalize_ollama_url_delegates(self):
+        """normalize_ollama_url should produce the same result as normalize_server_url."""
+        url = "  http://ollama.local:11434/  "
+        self.assertEqual(
+            ocr_service.normalize_ollama_url(url),
+            ocr_service.normalize_server_url(url),
+        )
+
+
 class TestValidateInputPath(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -226,6 +284,50 @@ class TestListModels(unittest.TestCase):
             with self.assertRaises(OCRServiceError) as ctx:
                 ocr_service.list_models(self.URL)
         self.assertIn(self.URL, str(ctx.exception))
+
+
+class TestListLmStudioModels(unittest.TestCase):
+    URL = "http://server:1234"
+
+    def test_extraction_dedup_and_case_insensitive_sort(self):
+        response = SimpleNamespace(
+            data=[
+                SimpleNamespace(id="zeta-7b"),
+                SimpleNamespace(id="Alpha-12b"),
+                SimpleNamespace(id="  "),
+                SimpleNamespace(id="zeta-7b"),
+                SimpleNamespace(id=None),
+                SimpleNamespace(id="beta-2b "),
+            ]
+        )
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls:
+            client_cls.return_value.models.list.return_value = response
+            result = ocr_service.list_lm_studio_models(self.URL)
+        self.assertEqual(result, ["Alpha-12b", "beta-2b", "zeta-7b"])
+        client_cls.assert_called_once()
+        call_kwargs = client_cls.call_args.kwargs
+        self.assertEqual(call_kwargs["base_url"], self.URL + "/v1")
+        self.assertEqual(call_kwargs["api_key"], "lm-studio")
+
+    def test_empty_server_list(self):
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls:
+            client_cls.return_value.models.list.return_value = SimpleNamespace(data=[])
+            self.assertEqual(ocr_service.list_lm_studio_models(self.URL), [])
+
+    def test_client_construction_error_propagates_with_context(self):
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls:
+            client_cls.side_effect = ConnectionError("connection refused")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.list_lm_studio_models(self.URL)
+        self.assertIn(self.URL, str(ctx.exception))
+        self.assertIn("connection refused", str(ctx.exception))
+
+    def test_list_call_error_propagates_with_context(self):
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls:
+            client_cls.return_value.models.list.side_effect = TimeoutError("timed out")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.list_lm_studio_models(self.URL)
+        self.assertIn("timed out", str(ctx.exception))
 
 
 class TestOpenInDefaultApp(unittest.TestCase):
@@ -757,7 +859,8 @@ class TestProcessOcr(unittest.TestCase):
         return OCRRequest(
             input_path=input_path,
             output_path=ocr_service.build_output_path(input_path),
-            ollama_url=self.URL,
+            provider=config.Provider.OLLAMA,
+            server_url=self.URL,
             model=self.MODEL,
             dpi=dpi,
         )
@@ -1063,6 +1166,345 @@ class TestProcessOcr(unittest.TestCase):
         self.assertIn("returned no text", str(error))
         self.assertIn("page 1/1", str(error))
         self.assertFalse(request.output_path.exists())
+
+
+class TestRecognizeImagesOpenAI(unittest.TestCase):
+    """Tests for the OpenAI-compatible recognition path (LM Studio, vLLM)."""
+
+    MODEL = "llama-3.2-vision"
+
+    def _openai_stream_chunk(self, content):
+        """Shape of openai streaming chunks: choices[0].delta.content."""
+        delta = SimpleNamespace(content=content)
+        choice = SimpleNamespace(delta=delta)
+        return SimpleNamespace(choices=[choice])
+
+    def _patch_encode(self):
+        """Patch encode_image_as_base64 so tests don't need real image files."""
+        return mock.patch.object(
+            ocr_service, "encode_image_as_base64",
+            return_value="data:image/png;base64,fake",
+        )
+
+    def test_one_request_per_image_with_base64_and_prompt(self):
+        client = mock.MagicMock()
+        client.chat.completions.create.side_effect = [
+            iter([self._openai_stream_chunk(" one ")]),
+            iter([self._openai_stream_chunk("two\n")]),
+        ]
+        paths = [Path("/imgs/page_0001.png"), Path("/imgs/page_0002.png")]
+        with self._patch_encode():
+            results = ocr_service.recognize_images_openai(
+                client, self.MODEL, paths, lambda _msg: None
+            )
+        self.assertEqual(results, ["one", "two"])
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        for call, path in zip(client.chat.completions.create.call_args_list, paths):
+            self.assertTrue(call.kwargs["stream"])
+            self.assertEqual(call.kwargs["model"], self.MODEL)
+            messages = call.kwargs["messages"]
+            self.assertEqual(messages[0]["role"], "system")
+            self.assertEqual(messages[0]["content"], config.SYSTEM_PROMPT)
+            user_msg = messages[1]
+            self.assertEqual(user_msg["role"], "user")
+            content_parts = user_msg["content"]
+            self.assertEqual(content_parts[0]["type"], "text")
+            self.assertEqual(content_parts[0]["text"], config.USER_PROMPT)
+            self.assertEqual(content_parts[1]["type"], "image_url")
+            self.assertEqual(
+                content_parts[1]["image_url"]["url"],
+                "data:image/png;base64,fake",
+            )
+
+    def test_progress_callback_emits_ocr_before_each_page(self):
+        client = mock.MagicMock()
+        client.chat.completions.create.side_effect = [
+            iter([self._openai_stream_chunk(f"p{i}")]) for i in range(3)
+        ]
+        events = []
+        with self._patch_encode():
+            ocr_service.recognize_images_openai(
+                client,
+                self.MODEL,
+                [Path(f"/i/{i}.png") for i in range(3)],
+                lambda _msg: None,
+                lambda phase, cur, tot: events.append((phase, cur, tot)),
+            )
+        self.assertEqual(
+            events,
+            [("ocr", 1, 3), ("ocr", 2, 3), ("ocr", 3, 3)],
+        )
+
+    def test_empty_content_fails_identifying_page(self):
+        for empty in (None, "", "   \n\t"):
+            with self.subTest(content=repr(empty)):
+                client = mock.MagicMock()
+                client.chat.completions.create.side_effect = [
+                    iter([self._openai_stream_chunk("fine")]),
+                    iter([self._openai_stream_chunk(empty)]),
+                ]
+                with self._patch_encode():
+                    with self.assertRaises(OCRServiceError) as ctx:
+                        ocr_service.recognize_images_openai(
+                            client,
+                            self.MODEL,
+                            [Path("/i/1.png"), Path("/i/2.png")],
+                            lambda _msg: None,
+                        )
+                self.assertIn("page 2/2", str(ctx.exception))
+
+    def test_chat_failure_wrapped_with_page_and_model_context(self):
+        client = mock.MagicMock()
+        client.chat.completions.create.side_effect = [
+            iter([self._openai_stream_chunk("ok")]),
+            RuntimeError("model not found"),
+        ]
+        with self._patch_encode():
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.recognize_images_openai(
+                    client,
+                    self.MODEL,
+                    [Path("/i/1.png"), Path("/i/2.png")],
+                    lambda _msg: None,
+                )
+        message = str(ctx.exception)
+        self.assertIn("page 2/2", message)
+        self.assertIn(self.MODEL, message)
+        self.assertIn("model not found", message)
+
+    def test_stream_chunk_events_emitted_in_order(self):
+        client = mock.MagicMock()
+        client.chat.completions.create.side_effect = [
+            iter([
+                self._openai_stream_chunk("Hel"),
+                self._openai_stream_chunk("lo"),
+                self._openai_stream_chunk(" world"),
+            ]),
+            iter([self._openai_stream_chunk("foo")]),
+        ]
+        events = []
+        with self._patch_encode():
+            ocr_service.recognize_images_openai(
+                client,
+                self.MODEL,
+                [Path("/i/1.png"), Path("/i/2.png")],
+                lambda _msg: None,
+                event_callback=lambda kind, payload: events.append((kind, payload)),
+            )
+        stream_events = [(k, p) for k, p in events if k == "stream_chunk"]
+        self.assertEqual(
+            stream_events,
+            [
+                ("stream_chunk", {"page": 1, "text": "Hel"}),
+                ("stream_chunk", {"page": 1, "text": "lo"}),
+                ("stream_chunk", {"page": 1, "text": " world"}),
+                ("stream_chunk", {"page": 2, "text": "foo"}),
+            ],
+        )
+
+    def test_page_text_events_emitted_after_each_page(self):
+        client = mock.MagicMock()
+        client.chat.completions.create.side_effect = [
+            iter([
+                self._openai_stream_chunk("  Hello "),
+                self._openai_stream_chunk("world  "),
+            ]),
+            iter([self._openai_stream_chunk("second")]),
+        ]
+        events = []
+        with self._patch_encode():
+            results = ocr_service.recognize_images_openai(
+                client,
+                self.MODEL,
+                [Path("/i/1.png"), Path("/i/2.png")],
+                lambda _msg: None,
+                event_callback=lambda kind, payload: events.append((kind, payload)),
+            )
+        page_events = [(k, p) for k, p in events if k == "page_text"]
+        self.assertEqual(
+            page_events,
+            [
+                ("page_text", {"page": 1, "total": 2, "text": "Hello world"}),
+                ("page_text", {"page": 2, "total": 2, "text": "second"}),
+            ],
+        )
+        self.assertEqual(results, ["Hello world", "second"])
+
+    def test_provider_name_in_error_messages(self):
+        """The provider_name parameter appears in error messages."""
+        client = mock.MagicMock()
+        client.chat.completions.create.side_effect = [
+            iter([self._openai_stream_chunk("ok")]),
+            RuntimeError("model not found"),
+        ]
+        with self._patch_encode():
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.recognize_images_openai(
+                    client,
+                    self.MODEL,
+                    [Path("/i/1.png"), Path("/i/2.png")],
+                    lambda _msg: None,
+                    provider_name="vLLM",
+                )
+        self.assertIn("vLLM request failed", str(ctx.exception))
+
+
+class TestProcessOcrOpenAI(unittest.TestCase):
+    """Integration-style tests for process_ocr with OpenAI-compatible providers."""
+
+    URL = "http://server:1234"
+    MODEL = "llama-3.2-vision"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def make_request(self, name, dpi=150, provider=config.Provider.LM_STUDIO):
+        input_path = self.dir / name
+        input_path.write_bytes(b"fake bytes")
+        return OCRRequest(
+            input_path=input_path,
+            output_path=ocr_service.build_output_path(input_path),
+            provider=provider,
+            server_url=self.URL,
+            model=self.MODEL,
+            dpi=dpi,
+        )
+
+    def _openai_stream_chunk(self, content):
+        delta = SimpleNamespace(content=content)
+        choice = SimpleNamespace(delta=delta)
+        return SimpleNamespace(choices=[choice])
+
+    def test_image_input_uses_openai_client(self):
+        request = self.make_request("photo.png")
+        events = queue.Queue()
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls, \
+                mock.patch.object(
+                    ocr_service, "encode_image_as_base64",
+                    return_value="data:image/png;base64,fake",
+                ):
+            client_cls.return_value.chat.completions.create.return_value = iter([
+                self._openai_stream_chunk("recognized")
+            ])
+            result = ocr_service.process_ocr(request, events)
+        self.assertEqual(result, request.output_path)
+        self.assertEqual(
+            request.output_path.read_text(encoding="utf-8"), "recognized"
+        )
+        client_cls.assert_called_once()
+        call_kwargs = client_cls.call_args.kwargs
+        self.assertEqual(call_kwargs["base_url"], self.URL + "/v1")
+        self.assertEqual(call_kwargs["api_key"], "lm-studio")
+        self.assertTrue(
+            client_cls.return_value.chat.completions.create.call_args.kwargs["stream"]
+        )
+        logs = [payload for kind, payload in drain(events) if kind == "log"]
+        self.assertEqual(logs[0], "[1/3] Preparing image...")
+        self.assertIn("[2/3] Sending page 1/1 to LM Studio...", logs)
+        self.assertIn("[3/3] Saving Markdown...", logs)
+
+    def test_pdf_pipeline_uses_openai_client(self):
+        request = self.make_request("doc.pdf")
+        document = make_fake_document(2)
+        events = queue.Queue()
+        created = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created.append(path)
+            return path
+
+        with mock.patch.object(ocr_service, "pymupdf") as fake_pymupdf, \
+                mock.patch.object(ocr_service.openai, "OpenAI") as client_cls, \
+                mock.patch.object(
+                    ocr_service.tempfile, "mkdtemp", side_effect=spy_mkdtemp
+                ), \
+                mock.patch.object(
+                    ocr_service, "encode_image_as_base64",
+                    return_value="data:image/png;base64,fake",
+                ):
+            fake_pymupdf.open.return_value = document
+            client_cls.return_value.chat.completions.create.side_effect = [
+                iter([self._openai_stream_chunk("p1")]),
+                iter([self._openai_stream_chunk("p2")]),
+            ]
+            result = ocr_service.process_ocr(request, events)
+        self.assertEqual(result, request.output_path)
+        self.assertEqual(
+            request.output_path.read_text(encoding="utf-8"), "p1\n\np2"
+        )
+        self.assertEqual(len(created), 1)
+        self.assertFalse(Path(created[0]).exists())
+
+    def test_vllm_provider_uses_openai_client(self):
+        """vLLM provider should use the same OpenAI-compatible path."""
+        request = self.make_request("photo.png", provider=config.Provider.VLLM)
+        events = queue.Queue()
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls, \
+                mock.patch.object(
+                    ocr_service, "encode_image_as_base64",
+                    return_value="data:image/png;base64,fake",
+                ):
+            client_cls.return_value.chat.completions.create.return_value = iter([
+                self._openai_stream_chunk("recognized")
+            ])
+            result = ocr_service.process_ocr(request, events)
+        self.assertEqual(result, request.output_path)
+        self.assertEqual(
+            request.output_path.read_text(encoding="utf-8"), "recognized"
+        )
+        client_cls.assert_called_once()
+        call_kwargs = client_cls.call_args.kwargs
+        self.assertEqual(call_kwargs["base_url"], self.URL + "/v1")
+        logs = [payload for kind, payload in drain(events) if kind == "log"]
+        self.assertIn("[2/3] Sending page 1/1 to vLLM...", logs)
+
+
+class TestListVllmModels(unittest.TestCase):
+    URL = "http://server:8000"
+
+    def test_extraction_dedup_and_case_insensitive_sort(self):
+        response = SimpleNamespace(
+            data=[
+                SimpleNamespace(id="zeta-7b"),
+                SimpleNamespace(id="Alpha-12b"),
+                SimpleNamespace(id="  "),
+                SimpleNamespace(id="zeta-7b"),
+                SimpleNamespace(id=None),
+                SimpleNamespace(id="beta-2b "),
+            ]
+        )
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls:
+            client_cls.return_value.models.list.return_value = response
+            result = ocr_service.list_vllm_models(self.URL)
+        self.assertEqual(result, ["Alpha-12b", "beta-2b", "zeta-7b"])
+        client_cls.assert_called_once()
+        call_kwargs = client_cls.call_args.kwargs
+        self.assertEqual(call_kwargs["base_url"], self.URL + "/v1")
+        self.assertEqual(call_kwargs["api_key"], "lm-studio")
+
+    def test_empty_server_list(self):
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls:
+            client_cls.return_value.models.list.return_value = SimpleNamespace(data=[])
+            self.assertEqual(ocr_service.list_vllm_models(self.URL), [])
+
+    def test_client_construction_error_propagates_with_context(self):
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls:
+            client_cls.side_effect = ConnectionError("connection refused")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.list_vllm_models(self.URL)
+        self.assertIn(self.URL, str(ctx.exception))
+        self.assertIn("connection refused", str(ctx.exception))
+
+    def test_list_call_error_propagates_with_context(self):
+        with mock.patch.object(ocr_service.openai, "OpenAI") as client_cls:
+            client_cls.return_value.models.list.side_effect = TimeoutError("timed out")
+            with self.assertRaises(OCRServiceError) as ctx:
+                ocr_service.list_vllm_models(self.URL)
+        self.assertIn("timed out", str(ctx.exception))
 
 
 if __name__ == "__main__":
