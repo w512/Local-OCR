@@ -102,30 +102,46 @@ class LocalOCRApp(ctk.CTk):
         settings.grid(row=1, column=0, sticky="ew", padx=PADX, pady=4)
         settings.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(settings, text="Ollama server URL").grid(
+        ctk.CTkLabel(settings, text="Provider").grid(
             row=0, column=0, sticky="w", padx=PADX, pady=(PADY, 4)
+        )
+        self.provider_combobox = ctk.CTkComboBox(
+            settings,
+            values=[p.value for p in config.Provider],
+            state="readonly",
+            width=130,
+        )
+        self.provider_combobox.set(config.Provider.OLLAMA.value)
+        self.provider_combobox.grid(
+            row=0, column=1, sticky="w", padx=(0, 8), pady=(PADY, 4)
+        )
+        self.provider_combobox.bind("<<ComboboxSelected>>", self._on_provider_changed)
+
+        self.url_label = ctk.CTkLabel(settings, text="Server URL")
+        self.url_label.grid(
+            row=1, column=0, sticky="w", padx=PADX, pady=(PADY, 4)
         )
         self.url_entry = ctk.CTkEntry(settings)
         self.url_entry.insert(0, config.DEFAULT_OLLAMA_URL)
-        self.url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(PADY, 4))
+        self.url_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(PADY, 4))
         self.refresh_button = ctk.CTkButton(
             settings, text="Refresh Models", width=130, command=self.refresh_models
         )
-        self.refresh_button.grid(row=0, column=2, padx=(0, PADX), pady=(PADY, 4))
+        self.refresh_button.grid(row=1, column=2, padx=(0, PADX), pady=(PADY, 4))
 
         ctk.CTkLabel(settings, text="Model").grid(
-            row=1, column=0, sticky="w", padx=PADX, pady=4
+            row=2, column=0, sticky="w", padx=PADX, pady=4
         )
         self.model_combobox = ctk.CTkComboBox(
             settings, values=list(config.EXAMPLE_MODELS)
         )
         self.model_combobox.set("")  # suggestions are not installed models
         self.model_combobox.grid(
-            row=1, column=1, columnspan=2, sticky="ew", padx=(0, PADX), pady=4
+            row=2, column=1, columnspan=2, sticky="ew", padx=(0, PADX), pady=4
         )
 
         ctk.CTkLabel(settings, text="PDF DPI").grid(
-            row=2, column=0, sticky="w", padx=PADX, pady=(4, PADY)
+            row=3, column=0, sticky="w", padx=PADX, pady=(4, PADY)
         )
         self.dpi_combobox = ctk.CTkComboBox(
             settings,
@@ -134,7 +150,7 @@ class LocalOCRApp(ctk.CTk):
             width=120,
         )
         self.dpi_combobox.set(str(config.DEFAULT_DPI))
-        self.dpi_combobox.grid(row=2, column=1, sticky="w", pady=(4, PADY))
+        self.dpi_combobox.grid(row=3, column=1, sticky="w", pady=(4, PADY))
 
         # Action + feedback section
         self.start_button = ctk.CTkButton(
@@ -419,12 +435,14 @@ class LocalOCRApp(ctk.CTk):
     # ---------------------------------------------------- control states
 
     def _apply_refresh_busy_state(self) -> None:
+        self.provider_combobox.configure(state="disabled")
         self.url_entry.configure(state="disabled")
         self.refresh_button.configure(state="disabled")
         self.start_button.configure(state="disabled")
 
     def _apply_ocr_busy_state(self) -> None:
         self.select_button.configure(state="disabled")
+        self.provider_combobox.configure(state="disabled")
         self.url_entry.configure(state="disabled")
         self.refresh_button.configure(state="disabled")
         self.model_combobox.configure(state="disabled")
@@ -443,6 +461,7 @@ class LocalOCRApp(ctk.CTk):
 
     def _restore_idle(self) -> None:
         self.select_button.configure(state="normal")
+        self.provider_combobox.configure(state="readonly")
         self.url_entry.configure(state="normal")
         self.refresh_button.configure(state="normal")
         self.model_combobox.configure(state="normal")
@@ -479,24 +498,57 @@ class LocalOCRApp(ctk.CTk):
 
     # ------------------------------------------------------ model refresh
 
+    def _current_provider(self) -> config.Provider:
+        """Return the currently selected provider from the combobox."""
+        value = self.provider_combobox.get().strip()
+        try:
+            return config.Provider(value)
+        except ValueError:
+            return config.Provider.OLLAMA
+
+    def _on_provider_changed(self, event=None) -> None:
+        """Update the URL entry default when the provider changes."""
+        provider = self._current_provider()
+        if provider == config.Provider.LM_STUDIO:
+            default_url = config.DEFAULT_LM_STUDIO_URL
+        elif provider == config.Provider.VLLM:
+            default_url = config.DEFAULT_VLLM_URL
+        else:
+            default_url = config.DEFAULT_OLLAMA_URL
+        current = self.url_entry.get().strip()
+        # Only replace the URL if it's empty or matches a known default.
+        if not current or current in (
+            config.DEFAULT_OLLAMA_URL,
+            config.DEFAULT_LM_STUDIO_URL,
+            config.DEFAULT_VLLM_URL,
+        ):
+            self.url_entry.delete(0, "end")
+            self.url_entry.insert(0, default_url)
+
     def refresh_models(self) -> None:
         if self.operation_state is not OperationState.IDLE:
             return
         try:
-            url = ocr_service.normalize_ollama_url(self.url_entry.get())
+            url = ocr_service.normalize_server_url(self.url_entry.get())
         except ValueError as exc:
             messagebox.showerror("Invalid URL", str(exc), parent=self)
             return
+        provider = self._current_provider()
         self.operation_state = OperationState.REFRESHING_MODELS
         self._apply_refresh_busy_state()
         self.append_log(f"Refreshing model list from {url}...")
         threading.Thread(
-            target=self._refresh_worker, args=(url,), daemon=True
+            target=self._refresh_worker, args=(url, provider), daemon=True
         ).start()
 
-    def _refresh_worker(self, url: str) -> None:
+    def _refresh_worker(self, url: str, provider: config.Provider) -> None:
         try:
-            models = ocr_service.list_models(url)
+            if provider == config.Provider.LM_STUDIO:
+                models = ocr_service.list_lm_studio_models(url)
+            elif provider == config.Provider.VLLM:
+                models = ocr_service.list_vllm_models(url)
+            else:
+                models = ocr_service.list_models(url)
         except Exception as exc:
             self.event_queue.put(("refresh_error", str(exc)))
         else:
@@ -608,14 +660,15 @@ class LocalOCRApp(ctk.CTk):
             messagebox.showerror("Invalid file", str(exc), parent=self)
             return
         try:
-            url = ocr_service.normalize_ollama_url(self.url_entry.get())
+            url = ocr_service.normalize_server_url(self.url_entry.get())
         except ValueError as exc:
             messagebox.showerror("Invalid URL", str(exc), parent=self)
             return
+        provider = self._current_provider()
         model = self.model_combobox.get().strip()
         if not model:
             messagebox.showerror(
-                "No model", "Enter or select an Ollama model tag.", parent=self
+                "No model", "Enter or select a model tag.", parent=self
             )
             return
         try:
@@ -643,14 +696,15 @@ class LocalOCRApp(ctk.CTk):
         request = OCRRequest(
             input_path=input_path,
             output_path=output_path,
-            ollama_url=url,
+            provider=provider,
+            server_url=url,
             model=model,
             dpi=dpi,
         )
         self.operation_state = OperationState.PROCESSING_OCR
         self._apply_ocr_busy_state()
         self.append_log(f"[Start] Input: {input_path}")
-        self.append_log(f"[Start] Ollama: {url} | Model: {model}")
+        self.append_log(f"[Start] Provider: {provider.value} | Server: {url} | Model: {model}")
         threading.Thread(
             target=self._ocr_worker, args=(request,), daemon=True
         ).start()
