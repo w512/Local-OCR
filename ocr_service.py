@@ -18,6 +18,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 import ollama
+import openai
 import pymupdf
 
 import config
@@ -37,7 +38,8 @@ class OCRRequest:
 
     input_path: Path
     output_path: Path
-    ollama_url: str
+    provider: config.Provider
+    server_url: str
     model: str
     dpi: int
 
@@ -60,6 +62,36 @@ def normalize_ollama_url(value: str) -> str:
     if not parsed.netloc:
         raise ValueError(f"Ollama server URL has no host: {value.strip()!r}.")
     return url
+
+
+def normalize_server_url(value: str) -> str:
+    """Validate a user-entered server base URL and return it normalized.
+
+    Works for both Ollama and LM Studio URLs. Keeps any path prefix so
+    reverse-proxy URLs work; never appends /api because the respective
+    clients handle API paths themselves.
+    """
+    url = value.strip().rstrip("/")
+    if not url:
+        raise ValueError("Server URL is empty.")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            "Server URL must start with http:// or https:// "
+            f"(got: {value.strip()!r})."
+        )
+    if not parsed.netloc:
+        raise ValueError(f"Server URL has no host: {value.strip()!r}.")
+    return url
+
+
+def normalize_ollama_url(value: str) -> str:
+    """Validate a user-entered Ollama base URL and return it normalized.
+
+    Keeps any path prefix so reverse-proxy URLs work; never appends /api
+    because the official client handles API paths itself.
+    """
+    return normalize_server_url(value)
 
 
 def validate_input_path(path: Path) -> None:
@@ -95,6 +127,54 @@ def list_models(url: str) -> list[str]:
         raise OCRServiceError(f"Could not fetch models from {url}: {exc}") from exc
     tags.discard("")
     return sorted(tags, key=str.lower)
+
+
+def encode_image_as_base64(image_path: Path) -> str:
+    """Read an image file and return its contents as a base64 data URL.
+
+    Tk-free so it can be unit-tested headlessly.
+    """
+    import base64
+
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def list_openai_compatible_models(url: str, provider_name: str = "server") -> list[str]:
+    """Fetch model IDs from an OpenAI-compatible server (LM Studio, vLLM).
+
+    Both LM Studio and vLLM expose an OpenAI-compatible ``/v1/models``
+    endpoint. The ``openai`` library is used with a custom base_url so the
+    request goes to the local server rather than OpenAI's API.
+    """
+    try:
+        client = openai.OpenAI(
+            base_url=url.rstrip("/") + "/v1",
+            api_key="lm-studio",  # local servers ignore the key; a non-empty value is required
+            timeout=config.MODEL_LIST_TIMEOUT,
+        )
+        response = client.models.list()
+        tags = {
+            (getattr(item, "id", None) or "").strip()
+            for item in response.data
+        }
+    except Exception as exc:
+        raise OCRServiceError(
+            f"Could not fetch models from {provider_name} at {url}: {exc}"
+        ) from exc
+    tags.discard("")
+    return sorted(tags, key=str.lower)
+
+
+def list_lm_studio_models(url: str) -> list[str]:
+    """Fetch model IDs from an LM Studio server."""
+    return list_openai_compatible_models(url, "LM Studio")
+
+
+def list_vllm_models(url: str) -> list[str]:
+    """Fetch model IDs from a vLLM server."""
+    return list_openai_compatible_models(url, "vLLM")
 
 
 def render_pdf(
@@ -236,6 +316,93 @@ def recognize_images(
     return results
 
 
+def recognize_images_openai(
+    client: "openai.OpenAI",
+    model: str,
+    image_paths: list[Path],
+    log_callback: LogCallback,
+    progress_callback: ProgressCallback | None = None,
+    event_callback: EventCallback | None = None,
+    provider_name: str = "LM Studio",
+) -> list[str]:
+    """Send one independent chat request per image to an OpenAI-compatible server.
+
+    Both LM Studio and vLLM expose an OpenAI-compatible chat completions
+    endpoint. Images are base64-encoded and sent as ``image_url`` content
+    parts. Streaming works the same way as the Ollama path: each delta is
+    emitted as a ``stream_chunk`` event, and a final ``page_text`` event
+    follows.
+    """
+    total = len(image_paths)
+    results: list[str] = []
+    for number, image_path in enumerate(image_paths, start=1):
+        if progress_callback is not None:
+            progress_callback("ocr", number, total)
+        if event_callback is not None:
+            try:
+                png = make_thumbnail_png(image_path, config.THUMBNAIL_MAX_SIDE)
+            except Exception as exc:
+                log_callback(
+                    f"Could not build preview for page {number}/{total}: {exc}"
+                )
+            else:
+                event_callback(
+                    "page_image",
+                    {"page": number, "total": total, "png": png},
+                )
+        log_callback(f"Sending page {number}/{total} to {provider_name}...")
+        chunks: list[str] = []
+        try:
+            data_url = encode_image_as_base64(image_path)
+            stream = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": config.SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": config.USER_PROMPT},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    },
+                ],
+                stream=True,
+            )
+            for chunk in stream:
+                delta = (
+                    getattr(getattr(chunk, "choices", [None])[0] if chunk.choices else None, "delta", None)
+                    if chunk.choices
+                    else None
+                )
+                if delta is not None:
+                    content = getattr(delta, "content", None) or ""
+                    if content:
+                        chunks.append(content)
+                        if event_callback is not None:
+                            event_callback(
+                                "stream_chunk",
+                                {"page": number, "text": content},
+                            )
+        except Exception as exc:
+            raise OCRServiceError(
+                f"{provider_name} request failed on page {number}/{total} "
+                f"(model {model!r}): {exc}"
+            ) from exc
+        text = "".join(chunks).strip()
+        if not text:
+            raise OCRServiceError(
+                f"{provider_name} returned no text for page {number}/{total} "
+                f"(model {model!r})."
+            )
+        results.append(text)
+        if event_callback is not None:
+            event_callback(
+                "page_text",
+                {"page": number, "total": total, "text": text},
+            )
+    return results
+
+
 def save_markdown_atomic(output_path: Path, content: str) -> None:
     """Write content as UTF-8 with \\n newlines, then publish atomically."""
     normalized = content.replace("\r\n", "\n").replace("\r", "\n")
@@ -340,23 +507,41 @@ def process_ocr(request: OCRRequest, event_queue) -> Path:
             image_paths = [request.input_path]
 
         try:
-            client = ollama.Client(
-                host=request.ollama_url,
-                timeout=config.OCR_STREAM_IDLE_TIMEOUT,
-            )
+            if request.provider in (config.Provider.LM_STUDIO, config.Provider.VLLM):
+                provider_name = (
+                    "LM Studio" if request.provider == config.Provider.LM_STUDIO else "vLLM"
+                )
+                client = openai.OpenAI(
+                    base_url=request.server_url.rstrip("/") + "/v1",
+                    api_key="lm-studio",
+                    timeout=config.OCR_STREAM_IDLE_TIMEOUT,
+                )
+                page_texts = recognize_images_openai(
+                    client,
+                    request.model,
+                    image_paths,
+                    lambda message: log(f"[2/3] {message}"),
+                    progress,
+                    emit_event,
+                    provider_name=provider_name,
+                )
+            else:
+                client = ollama.Client(
+                    host=request.server_url,
+                    timeout=config.OCR_STREAM_IDLE_TIMEOUT,
+                )
+                page_texts = recognize_images(
+                    client,
+                    request.model,
+                    image_paths,
+                    lambda message: log(f"[2/3] {message}"),
+                    progress,
+                    emit_event,
+                )
         except Exception as exc:
             raise OCRServiceError(
-                f"Could not create Ollama client for {request.ollama_url}: {exc}"
+                f"Could not create client for {request.server_url}: {exc}"
             ) from exc
-
-        page_texts = recognize_images(
-            client,
-            request.model,
-            image_paths,
-            lambda message: log(f"[2/3] {message}"),
-            progress,
-            emit_event,
-        )
 
         log("[3/3] Saving Markdown...")
         save_markdown_atomic(request.output_path, "\n\n".join(page_texts))
