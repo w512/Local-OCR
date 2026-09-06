@@ -1,10 +1,24 @@
 """Configuration constants for the Local OCR application."""
 
+from enum import Enum
+
+
+class Provider(str, Enum):
+    """Supported LLM backend providers."""
+
+    OLLAMA = "ollama"
+    LM_STUDIO = "lm_studio"
+    VLLM = "vllm"
+
+
+# Default server URLs per provider.
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_LM_STUDIO_URL = "http://localhost:1234"
+DEFAULT_VLLM_URL = "http://localhost:8000"
 
 # Suggestions only. These tags are never assumed to exist on the server and
 # are never pulled automatically.
-EXAMPLE_MODELS = ["gemma4:12b", "qwen3.6:27b"]
+EXAMPLE_MODELS = ["glm-ocr",]
 
 DPI_OPTIONS = [100, 150, 200, 300]
 DEFAULT_DPI = 150

@@ -1,9 +1,20 @@
 # Local OCR
 
 A local, privacy-focused desktop application that converts PDFs and images to
-structured Markdown using Vision-Language models served by
-[Ollama](https://ollama.com). Nothing leaves your machine or network: the app
-talks only to the Ollama server URL you configure.
+structured Markdown using Vision-Language models. Nothing leaves your machine
+or network: the app talks only to the server URL you configure.
+
+## Supported Backends
+
+The app supports three local LLM backends:
+
+- **Ollama** — the default. Uses the official Ollama API.
+- **LM Studio** — uses the OpenAI-compatible API exposed by LM Studio's
+  local server.
+- **vLLM** — uses the OpenAI-compatible API exposed by vLLM's server.
+
+Select your backend from the **Provider** dropdown in the app's settings
+panel. The server URL field and default port update automatically.
 
 ## Requirements
 
@@ -11,11 +22,21 @@ talks only to the Ollama server URL you configure.
   Both Tk 8.6 and Tk 9.0 work with the pinned customtkinter version
   (customtkinter 6.x; older 5.2.x renders blank windows under Tk 9.0 on
   macOS).
-- A running Ollama server — locally or reachable on your network. The app
-  never starts, installs, or pulls anything itself.
+- A running Ollama or LM Studio server — locally or reachable on your
+  network. The app never starts, installs, or pulls anything itself.
 - A vision-capable model installed on that server.
 
 ## Installation
+
+### Using uv (recommended)
+
+```bash
+uv venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+uv sync
+```
+
+### Using pip
 
 ```bash
 python3 -m venv .venv
@@ -27,6 +48,9 @@ pip install -r requirements.txt
 
 ```bash
 python main.py
+
+# using uv
+uv run main.py
 ```
 
 ## Setting up Ollama
@@ -59,12 +83,50 @@ has, or type any model tag manually.
 anyone who can connect to that port. Only bind it to a trusted network and
 protect it with your firewall; Ollama has no built-in authentication.
 
+## Setting up LM Studio
+
+LM Studio exposes an OpenAI-compatible API. To use it:
+
+1. Install and launch [LM Studio](https://lmstudio.ai/).
+2. Open the **Local Server** tab and start the server (default port `1234`).
+3. Load a vision-capable model in LM Studio (e.g. `llama-3.2-vision`,
+   `gemma-3-vision`, or `qwen-vl`).
+4. In the app, select **LM Studio** from the Provider dropdown. The server
+   URL defaults to `http://localhost:1234`.
+5. Use `Refresh Models` to list what your LM Studio server has loaded, or
+   type a model ID manually.
+
+**Note:** LM Studio's API key is ignored by the local server; the app sends
+a placeholder key (`lm-studio`) as required by the OpenAI client library.
+
+## Setting up vLLM
+
+[vLLM](https://github.com/vllm-project/vllm) exposes an OpenAI-compatible API.
+To use it:
+
+1. Install vLLM and start the server with a vision-capable model:
+
+   ```bash
+   pip install vllm
+   vllm serve <model-id> --port 8000
+   ```
+
+2. In the app, select **vLLM** from the Provider dropdown. The server URL
+   defaults to `http://localhost:8000`.
+3. Use `Refresh Models` to list what your vLLM server has loaded, or type a
+   model ID manually.
+
+**Note:** Like LM Studio, vLLM's local server ignores the API key; the app
+sends a placeholder key (`lm-studio`) as required by the OpenAI client
+library.
+
 ## Usage
 
 1. `Select File` — choose one PDF or image (`.pdf`, `.png`, `.jpg`, `.jpeg`,
    `.webp`).
-2. Confirm the server URL, pick or type a model tag, and choose a PDF DPI
-   (100/150/200/300; higher is sharper but slower — DPI only affects PDFs).
+2. Select a **Provider** (Ollama, LM Studio, or vLLM), confirm the server
+   URL, pick or type a model tag, and choose a PDF DPI (100/150/200/300;
+   higher is sharper but slower — DPI only affects PDFs).
 3. `Start OCR`. Each PDF page is rendered and sent to the model in order.
 
 While a job runs you can follow it in several places:
@@ -95,7 +157,7 @@ atomically, so a failed run never leaves a partial result.
 
 | Symptom | Likely cause and fix |
 | --- | --- |
-| `connection refused` | Ollama is not running, or the URL/port is wrong. Start Ollama (`ollama serve` or the desktop app) and verify the URL. |
+| `connection refused` | The server is not running, or the URL/port is wrong. Start Ollama (`ollama serve`) or LM Studio's local server, and verify the URL. |
 | Timeout | Server unreachable (wrong LAN address, firewall) or the model is too slow for the page. Try a smaller model or lower DPI. |
-| `model not found` | The tag is not installed on that server. Check `ollama list` and `ollama pull <tag>` on the server. Models are never pulled automatically. |
+| `model not found` | The tag is not loaded on that server. Check the server's model list and load a model. Models are never pulled automatically. |
 | Empty or garbage output / "returned no text" | The selected model has no vision support. Choose a vision-capable model. |
